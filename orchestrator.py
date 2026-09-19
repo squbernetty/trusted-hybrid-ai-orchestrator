@@ -4,22 +4,26 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from io import StringIO
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Protocol
 
 import yaml
@@ -63,8 +67,770 @@ class WorkerStalledError(OrchestratorError):
     pass
 
 
+TRUST_EVENT_SCHEMA_VERSION = "1.0"
+
+EVENT_JOURNAL_FILENAME = "_event-journal.sqlite3"
+EVENT_JOURNAL_USER_VERSION = 1
+
+EVENT_JOURNAL_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS orchestrator_events (
+        event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        schema_version TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        source_class TEXT NOT NULL,
+        component TEXT NOT NULL,
+        task_id TEXT,
+        execution_id TEXT,
+        parent_execution_id TEXT,
+        request_id TEXT,
+        worker_role TEXT,
+        provider_id TEXT,
+        model_id TEXT,
+        state_before TEXT,
+        state_after TEXT,
+        reason_code TEXT,
+        evidence_refs_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS
+        idx_orchestrator_events_task_seq
+    ON orchestrator_events (task_id, event_seq)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS
+        idx_orchestrator_events_execution_seq
+    ON orchestrator_events (execution_id, event_seq)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS
+        idx_orchestrator_events_request_seq
+    ON orchestrator_events (request_id, event_seq)
+    """,
+)
+
+EVENT_JOURNAL_EXPECTED_COLUMNS = (
+    ("event_seq", "INTEGER", 0, 1),
+    ("event_id", "TEXT", 1, 0),
+    ("schema_version", "TEXT", 1, 0),
+    ("event_type", "TEXT", 1, 0),
+    ("occurred_at", "TEXT", 1, 0),
+    ("source_class", "TEXT", 1, 0),
+    ("component", "TEXT", 1, 0),
+    ("task_id", "TEXT", 0, 0),
+    ("execution_id", "TEXT", 0, 0),
+    ("parent_execution_id", "TEXT", 0, 0),
+    ("request_id", "TEXT", 0, 0),
+    ("worker_role", "TEXT", 0, 0),
+    ("provider_id", "TEXT", 0, 0),
+    ("model_id", "TEXT", 0, 0),
+    ("state_before", "TEXT", 0, 0),
+    ("state_after", "TEXT", 0, 0),
+    ("reason_code", "TEXT", 0, 0),
+    ("evidence_refs_json", "TEXT", 1, 0),
+    ("payload_json", "TEXT", 1, 0),
+)
+
+EVENT_JOURNAL_REQUIRED_INDEXES = (
+    (
+        "idx_orchestrator_events_task_seq",
+        ("task_id", "event_seq"),
+    ),
+    (
+        "idx_orchestrator_events_execution_seq",
+        ("execution_id", "event_seq"),
+    ),
+    (
+        "idx_orchestrator_events_request_seq",
+        ("request_id", "event_seq"),
+    ),
+)
+
+
+class OrchestratorEventSource(str, Enum):
+    TRUSTED_CORE = "trusted_core"
+    EXECUTION_SUPERVISOR = "execution_supervisor"
+    PROVIDER = "provider"
+    VERIFICATION = "verification"
+    HUMAN_AUTHORITY = "human_authority"
+    CONTROL_PLANE = "control_plane"
+
+
+class OrchestratorEventType(str, Enum):
+    REQUEST_ACCEPTED = "request.accepted"
+    REQUEST_REJECTED = "request.rejected"
+    REQUEST_REPLAYED = "request.replayed"
+    REQUEST_CONFLICT = "request.conflict"
+    REQUEST_INDETERMINATE = "request.indeterminate"
+    REQUEST_COMPLETED = "request.completed"
+    REQUEST_FAILED = "request.failed"
+
+    TASK_STATE_CHANGED = "task.state_changed"
+    ROUTING_DECIDED = "routing.decided"
+
+    EXECUTION_PREPARED = "execution.prepared"
+    EXECUTION_STARTED = "execution.started"
+    EXECUTION_PROGRESS_OBSERVED = "execution.progress_observed"
+    EXECUTION_PROGRESS_UNOBSERVABLE = "execution.progress_unobservable"
+    EXECUTION_STALLED = "execution.stalled"
+    EXECUTION_TIMED_OUT = "execution.timed_out"
+    EXECUTION_CANCEL_REQUESTED = "execution.cancel_requested"
+    EXECUTION_CANCEL_RESOLVED = "execution.cancel_resolved"
+    EXECUTION_FAILED = "execution.failed"
+    EXECUTION_COMPLETED = "execution.completed"
+
+    PROVIDER_INVENTORY_OBSERVED = "provider.inventory_observed"
+    MODEL_BINDING_SELECTED = "model.binding_selected"
+    MODEL_LOAD_OBSERVED = "model.load_observed"
+    BUDGET_RESOLVED = "budget.resolved"
+
+    EVIDENCE_RECORDED = "evidence.recorded"
+    EVIDENCE_PROMOTED = "evidence.promoted"
+
+    VERIFICATION_STARTED = "verification.started"
+    VERIFICATION_COMPLETED = "verification.completed"
+
+    APPROVAL_REQUIRED = "approval.required"
+    APPROVAL_RECORDED = "approval.recorded"
+
+    TRANSITION_PROPOSED = "transition.proposed"
+    TRANSITION_ACCEPTED = "transition.accepted"
+    TRANSITION_REJECTED = "transition.rejected"
+
+
+ORCHESTRATOR_EVENT_ALLOWED_SOURCES = {
+    OrchestratorEventType.REQUEST_ACCEPTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_REJECTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_REPLAYED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_CONFLICT: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_INDETERMINATE: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_COMPLETED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.REQUEST_FAILED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.TASK_STATE_CHANGED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.ROUTING_DECIDED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.EXECUTION_PREPARED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_STARTED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_PROGRESS_OBSERVED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_PROGRESS_UNOBSERVABLE: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_STALLED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_TIMED_OUT: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_CANCEL_REQUESTED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_CANCEL_RESOLVED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_FAILED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EXECUTION_COMPLETED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.PROVIDER_INVENTORY_OBSERVED: frozenset(
+        {OrchestratorEventSource.PROVIDER}
+    ),
+    OrchestratorEventType.MODEL_BINDING_SELECTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.MODEL_LOAD_OBSERVED: frozenset(
+        {OrchestratorEventSource.PROVIDER}
+    ),
+    OrchestratorEventType.BUDGET_RESOLVED: frozenset(
+        {OrchestratorEventSource.EXECUTION_SUPERVISOR}
+    ),
+    OrchestratorEventType.EVIDENCE_RECORDED: frozenset(
+        {
+            OrchestratorEventSource.TRUSTED_CORE,
+            OrchestratorEventSource.VERIFICATION,
+        }
+    ),
+    OrchestratorEventType.EVIDENCE_PROMOTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.VERIFICATION_STARTED: frozenset(
+        {OrchestratorEventSource.VERIFICATION}
+    ),
+    OrchestratorEventType.VERIFICATION_COMPLETED: frozenset(
+        {OrchestratorEventSource.VERIFICATION}
+    ),
+    OrchestratorEventType.APPROVAL_REQUIRED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.APPROVAL_RECORDED: frozenset(
+        {OrchestratorEventSource.HUMAN_AUTHORITY}
+    ),
+    OrchestratorEventType.TRANSITION_PROPOSED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.TRANSITION_ACCEPTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+    OrchestratorEventType.TRANSITION_REJECTED: frozenset(
+        {OrchestratorEventSource.TRUSTED_CORE}
+    ),
+}
+
+
+ORCHESTRATOR_EVENT_REQUIRED_FIELDS = {
+    OrchestratorEventType.REQUEST_ACCEPTED: ("request_id",),
+    OrchestratorEventType.REQUEST_REPLAYED: ("request_id",),
+    OrchestratorEventType.REQUEST_CONFLICT: ("request_id",),
+    OrchestratorEventType.REQUEST_INDETERMINATE: ("request_id",),
+    OrchestratorEventType.REQUEST_COMPLETED: ("request_id",),
+    OrchestratorEventType.REQUEST_FAILED: ("request_id",),
+    OrchestratorEventType.TASK_STATE_CHANGED: (
+        "task_id",
+        "state_before",
+        "state_after",
+    ),
+    OrchestratorEventType.ROUTING_DECIDED: (
+        "task_id",
+        "reason_code",
+    ),
+    OrchestratorEventType.EXECUTION_PREPARED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_STARTED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_PROGRESS_OBSERVED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_PROGRESS_UNOBSERVABLE: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_STALLED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_TIMED_OUT: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_CANCEL_REQUESTED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_CANCEL_RESOLVED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_FAILED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.EXECUTION_COMPLETED: (
+        "task_id",
+        "execution_id",
+    ),
+    OrchestratorEventType.PROVIDER_INVENTORY_OBSERVED: (
+        "provider_id",
+    ),
+    OrchestratorEventType.MODEL_BINDING_SELECTED: (
+        "worker_role",
+        "provider_id",
+        "model_id",
+    ),
+    OrchestratorEventType.MODEL_LOAD_OBSERVED: (
+        "provider_id",
+        "model_id",
+    ),
+    OrchestratorEventType.BUDGET_RESOLVED: (
+        "task_id",
+    ),
+    OrchestratorEventType.VERIFICATION_STARTED: (
+        "task_id",
+    ),
+    OrchestratorEventType.VERIFICATION_COMPLETED: (
+        "task_id",
+    ),
+    OrchestratorEventType.APPROVAL_REQUIRED: (
+        "task_id",
+    ),
+    OrchestratorEventType.APPROVAL_RECORDED: (
+        "task_id",
+    ),
+    OrchestratorEventType.TRANSITION_PROPOSED: (
+        "task_id",
+    ),
+    OrchestratorEventType.TRANSITION_ACCEPTED: (
+        "task_id",
+    ),
+    OrchestratorEventType.TRANSITION_REJECTED: (
+        "task_id",
+    ),
+}
+
+
+def _freeze_event_json_value(value: Any) -> Any:
+    if value is None or isinstance(
+        value,
+        (str, bool, int),
+    ):
+        return value
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise OrchestratorError(
+                "Orchestrator event payload numbers must be finite"
+            )
+
+        return value
+
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise OrchestratorError(
+                    "Orchestrator event payload mapping keys "
+                    "must be strings"
+                )
+
+            frozen[key] = _freeze_event_json_value(item)
+
+        return MappingProxyType(frozen)
+
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_event_json_value(item)
+            for item in value
+        )
+
+    raise OrchestratorError(
+        "Orchestrator event payload contains a "
+        f"non-JSON-safe value: {type(value).__name__}"
+    )
+
+
+@dataclass(frozen=True)
+class OrchestratorEventDraft:
+    schema_version: str
+    event_id: str
+    event_type: str
+    occurred_at: str
+    source_class: OrchestratorEventSource
+    component: str
+    task_id: str | None
+    execution_id: str | None
+    parent_execution_id: str | None
+    request_id: str | None
+    worker_role: str | None
+    provider_id: str | None
+    model_id: str | None
+    state_before: str | None
+    state_after: str | None
+    reason_code: str | None
+    evidence_refs: tuple[str, ...]
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        frozen_payload = _freeze_event_json_value(
+            self.payload
+        )
+
+        if not isinstance(frozen_payload, Mapping):
+            raise OrchestratorError(
+                "Orchestrator event draft payload must be a mapping"
+            )
+
+        object.__setattr__(
+            self,
+            "payload",
+            frozen_payload,
+        )
+
+
+@dataclass(frozen=True)
+class OrchestratorEvent:
+    schema_version: str
+    event_seq: int
+    event_id: str
+    event_type: str
+    occurred_at: str
+    source_class: OrchestratorEventSource
+    component: str
+    task_id: str | None
+    execution_id: str | None
+    parent_execution_id: str | None
+    request_id: str | None
+    worker_role: str | None
+    provider_id: str | None
+    model_id: str | None
+    state_before: str | None
+    state_after: str | None
+    reason_code: str | None
+    evidence_refs: tuple[str, ...]
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        frozen_payload = _freeze_event_json_value(
+            self.payload
+        )
+
+        if not isinstance(frozen_payload, Mapping):
+            raise OrchestratorError(
+                "Orchestrator event payload must be a mapping"
+            )
+
+        object.__setattr__(
+            self,
+            "payload",
+            frozen_payload,
+        )
+
+
+def materialize_orchestrator_event(
+    draft: OrchestratorEventDraft,
+    event_seq: int,
+) -> OrchestratorEvent:
+    if not isinstance(draft, OrchestratorEventDraft):
+        raise OrchestratorError(
+            "Orchestrator event materialization requires "
+            "OrchestratorEventDraft"
+        )
+
+    event = OrchestratorEvent(
+        schema_version=draft.schema_version,
+        event_seq=event_seq,
+        event_id=draft.event_id,
+        event_type=draft.event_type,
+        occurred_at=draft.occurred_at,
+        source_class=draft.source_class,
+        component=draft.component,
+        task_id=draft.task_id,
+        execution_id=draft.execution_id,
+        parent_execution_id=draft.parent_execution_id,
+        request_id=draft.request_id,
+        worker_role=draft.worker_role,
+        provider_id=draft.provider_id,
+        model_id=draft.model_id,
+        state_before=draft.state_before,
+        state_after=draft.state_after,
+        reason_code=draft.reason_code,
+        evidence_refs=draft.evidence_refs,
+        payload=draft.payload,
+    )
+
+    validate_orchestrator_event(event)
+    return event
+
+
+def validate_orchestrator_event_draft(
+    draft: OrchestratorEventDraft,
+) -> None:
+    materialize_orchestrator_event(
+        draft,
+        event_seq=1,
+    )
+
+
+def validate_orchestrator_event(
+    event: OrchestratorEvent,
+) -> None:
+    if not isinstance(event, OrchestratorEvent):
+        raise OrchestratorError(
+            "Orchestrator event must use OrchestratorEvent"
+        )
+
+    if event.schema_version != TRUST_EVENT_SCHEMA_VERSION:
+        raise OrchestratorError(
+            "Unsupported orchestrator event schema version: "
+            f"{event.schema_version!r}"
+        )
+
+    if type(event.event_seq) is not int or event.event_seq <= 0:
+        raise OrchestratorError(
+            "Orchestrator event sequence must be a positive integer"
+        )
+
+    for field_name, value in (
+        ("event_id", event.event_id),
+        ("event_type", event.event_type),
+        ("occurred_at", event.occurred_at),
+        ("component", event.component),
+    ):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+        ):
+            raise OrchestratorError(
+                f"Orchestrator event {field_name} must be a "
+                "non-empty string without surrounding whitespace"
+            )
+
+    if re.fullmatch(
+        r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+",
+        event.event_type,
+    ) is None:
+        raise OrchestratorError(
+            "Orchestrator event type must use dot-qualified "
+            "lowercase tokens"
+        )
+
+    try:
+        OrchestratorEventType(event.event_type)
+    except ValueError as exc:
+        raise OrchestratorError(
+            "Unsupported orchestrator event type: "
+            f"{event.event_type!r}"
+        ) from exc
+
+    try:
+        occurred_at = datetime.fromisoformat(
+            event.occurred_at.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise OrchestratorError(
+            "Orchestrator event occurred_at must be ISO 8601"
+        ) from exc
+
+    if (
+        occurred_at.tzinfo is None
+        or occurred_at.utcoffset()
+        != timezone.utc.utcoffset(None)
+    ):
+        raise OrchestratorError(
+            "Orchestrator event occurred_at must be UTC"
+        )
+
+    if not isinstance(
+        event.source_class,
+        OrchestratorEventSource,
+    ):
+        raise OrchestratorError(
+            "Orchestrator event source_class must use "
+            "OrchestratorEventSource"
+        )
+
+    for field_name in (
+        "task_id",
+        "execution_id",
+        "parent_execution_id",
+        "request_id",
+        "worker_role",
+        "provider_id",
+        "model_id",
+        "state_before",
+        "state_after",
+        "reason_code",
+    ):
+        value = getattr(event, field_name)
+
+        if value is None:
+            continue
+
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+        ):
+            raise OrchestratorError(
+                f"Orchestrator event {field_name} must be null "
+                "or a non-empty string without surrounding whitespace"
+            )
+
+    if not isinstance(event.evidence_refs, tuple):
+        raise OrchestratorError(
+            "Orchestrator event evidence_refs must be a tuple"
+        )
+
+    seen_evidence_refs: set[str] = set()
+
+    for evidence_ref in event.evidence_refs:
+        if (
+            not isinstance(evidence_ref, str)
+            or not evidence_ref.strip()
+            or evidence_ref != evidence_ref.strip()
+        ):
+            raise OrchestratorError(
+                "Orchestrator event evidence_refs entries must be "
+                "non-empty strings without surrounding whitespace"
+            )
+
+        if evidence_ref in seen_evidence_refs:
+            raise OrchestratorError(
+                "Orchestrator event evidence_refs must be unique"
+            )
+
+        seen_evidence_refs.add(evidence_ref)
+
+    if not isinstance(event.payload, Mapping):
+        raise OrchestratorError(
+            "Orchestrator event payload must be a mapping"
+        )
+
+    validate_orchestrator_event_semantics(event)
+
+
+def validate_orchestrator_event_semantics(
+    event: OrchestratorEvent,
+) -> None:
+    event_type = OrchestratorEventType(event.event_type)
+
+    allowed_sources = ORCHESTRATOR_EVENT_ALLOWED_SOURCES.get(
+        event_type
+    )
+
+    if allowed_sources is None:
+        raise OrchestratorError(
+            "Orchestrator event type has no source policy: "
+            f"{event_type.value!r}"
+        )
+
+    if event.source_class not in allowed_sources:
+        raise OrchestratorError(
+            "Orchestrator event source is not authorized for "
+            f"{event_type.value!r}: {event.source_class.value!r}"
+        )
+
+    required_fields = ORCHESTRATOR_EVENT_REQUIRED_FIELDS.get(
+        event_type,
+        (),
+    )
+
+    for field_name in required_fields:
+        if getattr(event, field_name) is None:
+            raise OrchestratorError(
+                "Orchestrator event is missing required context "
+                f"for {event_type.value!r}: {field_name}"
+            )
+
+    if (
+        event_type is OrchestratorEventType.TASK_STATE_CHANGED
+        and event.state_before == event.state_after
+    ):
+        raise OrchestratorError(
+            "task.state_changed requires different before "
+            "and after states"
+        )
+
+    if event_type in (
+        OrchestratorEventType.EVIDENCE_RECORDED,
+        OrchestratorEventType.EVIDENCE_PROMOTED,
+    ) and not event.evidence_refs:
+        raise OrchestratorError(
+            f"{event_type.value} requires evidence_refs"
+        )
+
+
+def _thaw_event_json_value(value: Any) -> Any:
+    if value is None or isinstance(
+        value,
+        (str, bool, int, float),
+    ):
+        return value
+
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_event_json_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return [
+            _thaw_event_json_value(item)
+            for item in value
+        ]
+
+    raise OrchestratorError(
+        "Orchestrator event contains an unserializable "
+        f"value: {type(value).__name__}"
+    )
+
+
+def orchestrator_event_to_mapping(
+    event: OrchestratorEvent,
+) -> dict[str, Any]:
+    validate_orchestrator_event(event)
+
+    return {
+        "schema_version": event.schema_version,
+        "event_seq": event.event_seq,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "occurred_at": event.occurred_at,
+        "source_class": event.source_class.value,
+        "component": event.component,
+        "task_id": event.task_id,
+        "execution_id": event.execution_id,
+        "parent_execution_id": event.parent_execution_id,
+        "request_id": event.request_id,
+        "worker_role": event.worker_role,
+        "provider_id": event.provider_id,
+        "model_id": event.model_id,
+        "state_before": event.state_before,
+        "state_after": event.state_after,
+        "reason_code": event.reason_code,
+        "evidence_refs": list(event.evidence_refs),
+        "payload": _thaw_event_json_value(event.payload),
+    }
+
+
+def canonical_orchestrator_event_json(
+    event: OrchestratorEvent,
+) -> str:
+    mapping = orchestrator_event_to_mapping(event)
+
+    return json.dumps(
+        mapping,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
 EXTERNAL_SUPERVISOR_SCHEMA_VERSION = "1.0"
 EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION = "1.0"
+EXTERNAL_REQUEST_LEDGER_FILENAME = "_external-request-ledger.sqlite3"
+EXTERNAL_REQUEST_STATUS_BY_DISPOSITION = {
+    "completed": "COMPLETED",
+    "failed": "FAILED",
+    "internal_error": "INTERNAL_ERROR",
+}
+EXTERNAL_REQUEST_TERMINAL_STATUSES = frozenset(
+    EXTERNAL_REQUEST_STATUS_BY_DISPOSITION.values()
+)
 
 EXTERNAL_DELEGATE_WORK_PRODUCTS = (
     "EXTRACT",
@@ -92,6 +858,36 @@ class ExternalSupervisorRequest:
     operation: ExternalSupervisorOperation
     task: str
     payload: dict[str, Any]
+
+
+class EventJournalError(OrchestratorError):
+    pass
+
+
+class ExternalRequestLedgerError(OrchestratorError):
+    pass
+
+
+class ExternalRequestReplayConflictError(OrchestratorError):
+    pass
+
+
+class ExternalRequestReplayIndeterminateError(OrchestratorError):
+    pass
+
+
+class ExternalRequestReservationState(str, Enum):
+    RESERVED = "RESERVED"
+    REPLAY = "REPLAY"
+    CONFLICT = "CONFLICT"
+    ACTIVE_OR_INDETERMINATE = "ACTIVE_OR_INDETERMINATE"
+
+
+@dataclass(frozen=True)
+class ExternalRequestReservation:
+    state: ExternalRequestReservationState
+    request_fingerprint: str
+    response: dict[str, Any] | None = None
 
 
 def external_supervisor_request_from_mapping(
@@ -224,12 +1020,1132 @@ def external_supervisor_request_from_json(
     )
 
 
+def event_journal_path() -> Path:
+    return STATE_DIR / EVENT_JOURNAL_FILENAME
+
+
+def external_request_ledger_path() -> Path:
+    return STATE_DIR / EXTERNAL_REQUEST_LEDGER_FILENAME
+
+
+def external_supervisor_request_fingerprint(
+    request: ExternalSupervisorRequest,
+) -> str:
+    validate_external_supervisor_request(request)
+
+    canonical = {
+        "schema_version": request.schema_version,
+        "request_id": request.request_id,
+        "supervisor_id": request.supervisor_id,
+        "operation": request.operation.value,
+        "task": request.task,
+        "payload": request.payload,
+    }
+
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_event_journal_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    try:
+        table_rows = connection.execute(
+            "PRAGMA table_info(orchestrator_events)"
+        ).fetchall()
+
+        actual_columns = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                int(row["pk"]),
+            )
+            for row in table_rows
+        )
+
+        if actual_columns != EVENT_JOURNAL_EXPECTED_COLUMNS:
+            raise EventJournalError(
+                "Event journal table schema does not match "
+                "the expected contract"
+            )
+
+        table_sql_row = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'orchestrator_events'
+            """
+        ).fetchone()
+
+        if (
+            table_sql_row is None
+            or not isinstance(table_sql_row["sql"], str)
+            or "AUTOINCREMENT"
+            not in table_sql_row["sql"].upper()
+        ):
+            raise EventJournalError(
+                "Event journal event_seq must use AUTOINCREMENT"
+            )
+
+        index_rows = connection.execute(
+            "PRAGMA index_list(orchestrator_events)"
+        ).fetchall()
+
+        indexes_by_name = {
+            str(row["name"]): row
+            for row in index_rows
+        }
+
+        for (
+            index_name,
+            expected_columns,
+        ) in EVENT_JOURNAL_REQUIRED_INDEXES:
+            index_row = indexes_by_name.get(index_name)
+
+            if index_row is None:
+                raise EventJournalError(
+                    "Event journal required index is missing: "
+                    f"{index_name}"
+                )
+
+            index_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA index_info('{index_name}')"
+                ).fetchall()
+            )
+
+            if index_columns != expected_columns:
+                raise EventJournalError(
+                    "Event journal index definition does not "
+                    f"match contract: {index_name}"
+                )
+
+        event_id_unique = False
+
+        for index_row in index_rows:
+            if int(index_row["unique"]) != 1:
+                continue
+
+            index_name = str(index_row["name"])
+
+            index_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA index_info('{index_name}')"
+                ).fetchall()
+            )
+
+            if index_columns == ("event_id",):
+                event_id_unique = True
+                break
+
+        if not event_id_unique:
+            raise EventJournalError(
+                "Event journal event_id must be unique"
+            )
+
+    except EventJournalError:
+        raise
+
+    except sqlite3.Error as exc:
+        raise EventJournalError(
+            "Event journal schema inspection failed"
+        ) from exc
+
+
+def _open_event_journal_read_only() -> sqlite3.Connection:
+    path = event_journal_path()
+
+    if not path.exists():
+        raise EventJournalError(
+            "Event journal does not exist"
+        )
+
+    if not path.is_file():
+        raise EventJournalError(
+            "Event journal path is not a file"
+        )
+
+    connection: sqlite3.Connection | None = None
+
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+
+        connection = sqlite3.connect(
+            uri,
+            timeout=5.0,
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+
+        connection.execute("PRAGMA query_only = ON")
+
+        version_row = connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()
+
+        if version_row is None:
+            raise EventJournalError(
+                "Event journal schema version is unavailable"
+            )
+
+        current_version = int(version_row[0])
+
+        if current_version != EVENT_JOURNAL_USER_VERSION:
+            raise EventJournalError(
+                "Unsupported event journal schema version: "
+                f"{current_version}"
+            )
+
+        event_table_exists = (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'orchestrator_events'
+                """
+            ).fetchone()
+            is not None
+        )
+
+        if not event_table_exists:
+            raise EventJournalError(
+                "Versioned event journal is missing "
+                "orchestrator_events"
+            )
+
+        _validate_event_journal_schema(connection)
+
+    except EventJournalError:
+        if connection is not None:
+            connection.close()
+
+        raise
+
+    except (OSError, sqlite3.Error) as exc:
+        if connection is not None:
+            connection.close()
+
+        raise EventJournalError(
+            "Event journal is unavailable for read-only access"
+        ) from exc
+
+    return connection
+
+
+def _open_event_journal() -> sqlite3.Connection:
+    connection: sqlite3.Connection | None = None
+
+    try:
+        path = event_journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        connection = sqlite3.connect(
+            path,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+
+        version_row = connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()
+
+        if version_row is None:
+            raise EventJournalError(
+                "Event journal schema version is unavailable"
+            )
+
+        current_version = int(version_row[0])
+
+        if current_version not in (
+            0,
+            EVENT_JOURNAL_USER_VERSION,
+        ):
+            raise EventJournalError(
+                "Unsupported event journal schema version: "
+                f"{current_version}"
+            )
+
+        event_table_exists = (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'orchestrator_events'
+                """
+            ).fetchone()
+            is not None
+        )
+
+        if current_version == 0 and event_table_exists:
+            raise EventJournalError(
+                "Unversioned event journal already contains "
+                "orchestrator_events"
+            )
+
+        if (
+            current_version == EVENT_JOURNAL_USER_VERSION
+            and not event_table_exists
+        ):
+            raise EventJournalError(
+                "Versioned event journal is missing "
+                "orchestrator_events"
+            )
+
+        if current_version == 0:
+            for statement in EVENT_JOURNAL_SCHEMA_STATEMENTS:
+                connection.execute(statement)
+
+            connection.execute(
+                "PRAGMA user_version = "
+                f"{EVENT_JOURNAL_USER_VERSION}"
+            )
+
+        _validate_event_journal_schema(connection)
+        connection.commit()
+
+    except EventJournalError:
+        if connection is not None:
+            connection.close()
+
+        raise
+
+    except (OSError, sqlite3.Error) as exc:
+        if connection is not None:
+            connection.close()
+
+        raise EventJournalError(
+            "Event journal is unavailable"
+        ) from exc
+
+    return connection
+
+
+def _orchestrator_event_from_journal_row(
+    row: sqlite3.Row,
+) -> OrchestratorEvent:
+    try:
+        event_seq = row["event_seq"]
+
+        if type(event_seq) is not int:
+            raise EventJournalError(
+                "Event journal event_seq is not an integer"
+            )
+
+        raw_source = row["source_class"]
+
+        if not isinstance(raw_source, str):
+            raise EventJournalError(
+                "Event journal source_class is not a string"
+            )
+
+        try:
+            source_class = OrchestratorEventSource(
+                raw_source
+            )
+        except ValueError as exc:
+            raise EventJournalError(
+                "Event journal contains unknown source_class"
+            ) from exc
+
+        evidence_refs_value = json.loads(
+            row["evidence_refs_json"]
+        )
+        payload_value = json.loads(
+            row["payload_json"]
+        )
+
+        if (
+            not isinstance(evidence_refs_value, list)
+            or not all(
+                isinstance(item, str)
+                for item in evidence_refs_value
+            )
+        ):
+            raise EventJournalError(
+                "Event journal evidence_refs_json is invalid"
+            )
+
+        if not isinstance(payload_value, dict):
+            raise EventJournalError(
+                "Event journal payload_json is invalid"
+            )
+
+        event = OrchestratorEvent(
+            schema_version=row["schema_version"],
+            event_seq=event_seq,
+            event_id=row["event_id"],
+            event_type=row["event_type"],
+            occurred_at=row["occurred_at"],
+            source_class=source_class,
+            component=row["component"],
+            task_id=row["task_id"],
+            execution_id=row["execution_id"],
+            parent_execution_id=row[
+                "parent_execution_id"
+            ],
+            request_id=row["request_id"],
+            worker_role=row["worker_role"],
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            state_before=row["state_before"],
+            state_after=row["state_after"],
+            reason_code=row["reason_code"],
+            evidence_refs=tuple(evidence_refs_value),
+            payload=payload_value,
+        )
+
+        validate_orchestrator_event(event)
+        return event
+
+    except EventJournalError:
+        raise
+
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        OrchestratorError,
+    ) as exc:
+        raise EventJournalError(
+            "Event journal row failed trusted reconstruction"
+        ) from exc
+
+
+def append_orchestrator_event(
+    draft: OrchestratorEventDraft,
+) -> OrchestratorEvent:
+    # Validation deliberately occurs before opening SQLite.
+    # Invalid events must not create or modify journal state.
+    validate_orchestrator_event_draft(draft)
+
+    evidence_refs_json = json.dumps(
+        list(draft.evidence_refs),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    payload_json = json.dumps(
+        _thaw_event_json_value(draft.payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    connection = _open_event_journal()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        cursor = connection.execute(
+            """
+            INSERT INTO orchestrator_events (
+                event_id,
+                schema_version,
+                event_type,
+                occurred_at,
+                source_class,
+                component,
+                task_id,
+                execution_id,
+                parent_execution_id,
+                request_id,
+                worker_role,
+                provider_id,
+                model_id,
+                state_before,
+                state_after,
+                reason_code,
+                evidence_refs_json,
+                payload_json
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                draft.event_id,
+                draft.schema_version,
+                draft.event_type,
+                draft.occurred_at,
+                draft.source_class.value,
+                draft.component,
+                draft.task_id,
+                draft.execution_id,
+                draft.parent_execution_id,
+                draft.request_id,
+                draft.worker_role,
+                draft.provider_id,
+                draft.model_id,
+                draft.state_before,
+                draft.state_after,
+                draft.reason_code,
+                evidence_refs_json,
+                payload_json,
+            ),
+        )
+
+        event_seq = cursor.lastrowid
+
+        if type(event_seq) is not int or event_seq <= 0:
+            raise EventJournalError(
+                "Event journal did not allocate a valid event_seq"
+            )
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM orchestrator_events
+            WHERE event_seq = ?
+            """,
+            (event_seq,),
+        ).fetchone()
+
+        if row is None:
+            raise EventJournalError(
+                "Appended event could not be read back"
+            )
+
+        event = _orchestrator_event_from_journal_row(
+            row
+        )
+
+        connection.commit()
+        return event
+
+    except EventJournalError:
+        connection.rollback()
+        raise
+
+    except sqlite3.IntegrityError as exc:
+        connection.rollback()
+        raise EventJournalError(
+            "Event journal rejected the event"
+        ) from exc
+
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise EventJournalError(
+            "Event journal append failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def read_orchestrator_events(
+    *,
+    after_event_seq: int = 0,
+    limit: int = 100,
+    task_id: str | None = None,
+    execution_id: str | None = None,
+    request_id: str | None = None,
+) -> tuple[OrchestratorEvent, ...]:
+    if (
+        type(after_event_seq) is not int
+        or after_event_seq < 0
+    ):
+        raise OrchestratorError(
+            "after_event_seq must be a non-negative integer"
+        )
+
+    if (
+        type(limit) is not int
+        or limit <= 0
+        or limit > 1000
+    ):
+        raise OrchestratorError(
+            "Event journal read limit must be between 1 and 1000"
+        )
+
+    filters = (
+        ("task_id", task_id),
+        ("execution_id", execution_id),
+        ("request_id", request_id),
+    )
+
+    for field_name, value in filters:
+        if value is None:
+            continue
+
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+        ):
+            raise OrchestratorError(
+                f"{field_name} filter must be null or a "
+                "non-empty string without surrounding whitespace"
+            )
+
+    clauses = ["event_seq > ?"]
+    parameters: list[Any] = [after_event_seq]
+
+    for field_name, value in filters:
+        if value is None:
+            continue
+
+        clauses.append(f"{field_name} = ?")
+        parameters.append(value)
+
+    parameters.append(limit)
+
+    query = (
+        "SELECT * "
+        "FROM orchestrator_events "
+        "WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY event_seq ASC "
+        "LIMIT ?"
+    )
+
+    connection = _open_event_journal()
+
+    try:
+        rows = connection.execute(
+            query,
+            tuple(parameters),
+        ).fetchall()
+
+        return tuple(
+            _orchestrator_event_from_journal_row(row)
+            for row in rows
+        )
+
+    except EventJournalError:
+        raise
+
+    except sqlite3.Error as exc:
+        raise EventJournalError(
+            "Event journal read failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def read_orchestrator_events_read_only(
+    *,
+    after_event_seq: int = 0,
+    limit: int = 100,
+    task_id: str | None = None,
+    execution_id: str | None = None,
+    request_id: str | None = None,
+) -> tuple[OrchestratorEvent, ...]:
+    if (
+        type(after_event_seq) is not int
+        or after_event_seq < 0
+    ):
+        raise OrchestratorError(
+            "after_event_seq must be a non-negative integer"
+        )
+
+    if (
+        type(limit) is not int
+        or limit <= 0
+        or limit > 1000
+    ):
+        raise OrchestratorError(
+            "Event journal read limit must be between 1 and 1000"
+        )
+
+    filters = (
+        ("task_id", task_id),
+        ("execution_id", execution_id),
+        ("request_id", request_id),
+    )
+
+    for field_name, value in filters:
+        if value is None:
+            continue
+
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+        ):
+            raise OrchestratorError(
+                f"{field_name} filter must be null or a "
+                "non-empty string without surrounding whitespace"
+            )
+
+    path = event_journal_path()
+
+    if not path.exists():
+        return ()
+
+    clauses = ["event_seq > ?"]
+    parameters: list[Any] = [after_event_seq]
+
+    for field_name, value in filters:
+        if value is None:
+            continue
+
+        clauses.append(f"{field_name} = ?")
+        parameters.append(value)
+
+    parameters.append(limit)
+
+    query = (
+        "SELECT * "
+        "FROM orchestrator_events "
+        "WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY event_seq ASC "
+        "LIMIT ?"
+    )
+
+    connection = _open_event_journal_read_only()
+
+    try:
+        rows = connection.execute(
+            query,
+            tuple(parameters),
+        ).fetchall()
+
+        return tuple(
+            _orchestrator_event_from_journal_row(row)
+            for row in rows
+        )
+
+    except EventJournalError:
+        raise
+
+    except sqlite3.Error as exc:
+        raise EventJournalError(
+            "Read-only event journal read failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def read_orchestrator_event_tail_read_only(
+    *,
+    limit: int = 100,
+) -> tuple[OrchestratorEvent, ...]:
+    if (
+        type(limit) is not int
+        or limit <= 0
+        or limit > 1000
+    ):
+        raise OrchestratorError(
+            "Event journal tail limit must be between 1 and 1000"
+        )
+
+    path = event_journal_path()
+
+    if not path.exists():
+        return ()
+
+    connection = _open_event_journal_read_only()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM orchestrator_events
+            ORDER BY event_seq DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return tuple(
+            _orchestrator_event_from_journal_row(row)
+            for row in reversed(rows)
+        )
+
+    except EventJournalError:
+        raise
+
+    except sqlite3.Error as exc:
+        raise EventJournalError(
+            "Read-only event journal tail read failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def _open_external_request_ledger() -> sqlite3.Connection:
+    connection: sqlite3.Connection | None = None
+
+    try:
+        path = external_request_ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        connection = sqlite3.connect(
+            path,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_requests (
+                request_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                supervisor_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                task_reference TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                response_json TEXT
+            )
+            """
+        )
+        connection.commit()
+
+    except (OSError, sqlite3.Error) as exc:
+        if connection is not None:
+            connection.close()
+
+        raise ExternalRequestLedgerError(
+            "External request ledger is unavailable"
+        ) from exc
+
+    return connection
+
+
+def reserve_external_supervisor_request(
+    request: ExternalSupervisorRequest,
+) -> ExternalRequestReservation:
+    fingerprint = external_supervisor_request_fingerprint(request)
+    connection = _open_external_request_ledger()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT request_fingerprint, status, response_json
+            FROM external_requests
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+
+        if row is None:
+            now = utc_now()
+
+            connection.execute(
+                """
+                INSERT INTO external_requests (
+                    request_id,
+                    request_fingerprint,
+                    schema_version,
+                    supervisor_id,
+                    operation,
+                    task_reference,
+                    status,
+                    created_at,
+                    updated_at,
+                    response_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    request.request_id,
+                    fingerprint,
+                    request.schema_version,
+                    request.supervisor_id,
+                    request.operation.value,
+                    request.task,
+                    "DISPATCHING",
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+            return ExternalRequestReservation(
+                state=ExternalRequestReservationState.RESERVED,
+                request_fingerprint=fingerprint,
+            )
+
+        if row["request_fingerprint"] != fingerprint:
+            connection.commit()
+
+            return ExternalRequestReservation(
+                state=ExternalRequestReservationState.CONFLICT,
+                request_fingerprint=fingerprint,
+            )
+
+        status = row["status"]
+        response_json = row["response_json"]
+
+        if status == "DISPATCHING" and response_json is None:
+            connection.commit()
+
+            return ExternalRequestReservation(
+                state=(
+                    ExternalRequestReservationState
+                    .ACTIVE_OR_INDETERMINATE
+                ),
+                request_fingerprint=fingerprint,
+            )
+
+        if status not in EXTERNAL_REQUEST_TERMINAL_STATUSES:
+            raise ExternalRequestLedgerError(
+                "External request ledger contains an invalid request status"
+            )
+
+        if response_json is None:
+            raise ExternalRequestLedgerError(
+                "External request ledger terminal response is missing"
+            )
+
+        try:
+            response = json.loads(response_json)
+        except json.JSONDecodeError as exc:
+            raise ExternalRequestLedgerError(
+                "External request ledger contains malformed response JSON"
+            ) from exc
+
+        if not isinstance(response, dict):
+            raise ExternalRequestLedgerError(
+                "External request ledger contains invalid response data"
+            )
+
+        expected_status = EXTERNAL_REQUEST_STATUS_BY_DISPOSITION.get(
+            response.get("disposition")
+        )
+
+        if (
+            response.get("schema_version")
+            != EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION
+            or response.get("request_id") != request.request_id
+            or expected_status != status
+        ):
+            raise ExternalRequestLedgerError(
+                "External request ledger terminal response is inconsistent"
+            )
+
+        connection.commit()
+
+        return ExternalRequestReservation(
+            state=ExternalRequestReservationState.REPLAY,
+            request_fingerprint=fingerprint,
+            response=response,
+        )
+
+    except ExternalRequestLedgerError:
+        connection.rollback()
+        raise
+
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise ExternalRequestLedgerError(
+            "External request ledger reservation failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def persist_external_supervisor_response(
+    request: ExternalSupervisorRequest,
+    *,
+    request_fingerprint: str,
+    response: dict[str, Any],
+) -> None:
+    if response.get("request_id") != request.request_id:
+        raise ExternalRequestLedgerError(
+            "External request ledger response request_id mismatch"
+        )
+
+    disposition = response.get("disposition")
+    status = EXTERNAL_REQUEST_STATUS_BY_DISPOSITION.get(disposition)
+
+    if status is None:
+        raise ExternalRequestLedgerError(
+            "External request ledger cannot persist response disposition"
+        )
+
+    response_json = json.dumps(
+        response,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+    connection = _open_external_request_ledger()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT request_fingerprint, status, response_json
+            FROM external_requests
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+
+        if row is None:
+            raise ExternalRequestLedgerError(
+                "External request ledger reservation is missing"
+            )
+
+        if row["request_fingerprint"] != request_fingerprint:
+            raise ExternalRequestLedgerError(
+                "External request ledger fingerprint changed"
+            )
+
+        stored_response = row["response_json"]
+
+        if stored_response is not None:
+            if row["status"] == status and stored_response == response_json:
+                connection.commit()
+                return
+
+            raise ExternalRequestLedgerError(
+                "External request ledger terminal response conflict"
+            )
+
+        if row["status"] != "DISPATCHING":
+            raise ExternalRequestLedgerError(
+                "External request ledger request is not dispatching"
+            )
+
+        connection.execute(
+            """
+            UPDATE external_requests
+            SET status = ?, updated_at = ?, response_json = ?
+            WHERE request_id = ?
+            """,
+            (
+                status,
+                utc_now(),
+                response_json,
+                request.request_id,
+            ),
+        )
+        connection.commit()
+
+    except ExternalRequestLedgerError:
+        connection.rollback()
+        raise
+
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise ExternalRequestLedgerError(
+            "External request ledger finalization failed"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def emit_external_supervisor_event(
+    event_type: OrchestratorEventType,
+    *,
+    request: ExternalSupervisorRequest | None,
+    reason_code: str | None = None,
+    details: Mapping[str, Any] | None = None,
+) -> OrchestratorEvent | None:
+    if not isinstance(event_type, OrchestratorEventType):
+        raise OrchestratorError(
+            "External supervisor event type must use "
+            "OrchestratorEventType"
+        )
+
+    if not event_type.value.startswith("request."):
+        raise OrchestratorError(
+            "External supervisor emitter only accepts request events"
+        )
+
+    if request is not None:
+        validate_external_supervisor_request(request)
+
+    if details is not None and not isinstance(details, Mapping):
+        raise OrchestratorError(
+            "External supervisor event details must be a mapping"
+        )
+
+    payload: dict[str, Any] = {}
+
+    if request is not None:
+        payload["supervisor_id"] = request.supervisor_id
+        payload["operation"] = request.operation.value
+        payload["task_reference"] = request.task
+
+    if details is not None:
+        payload["details"] = dict(details)
+
+    draft = OrchestratorEventDraft(
+        schema_version=TRUST_EVENT_SCHEMA_VERSION,
+        event_id=f"evt-{uuid.uuid4().hex}",
+        event_type=event_type.value,
+        occurred_at=utc_now(),
+        source_class=OrchestratorEventSource.TRUSTED_CORE,
+        component="external_supervisor_protocol",
+        task_id=None,
+        execution_id=None,
+        parent_execution_id=None,
+        request_id=(
+            request.request_id
+            if request is not None
+            else None
+        ),
+        worker_role=None,
+        provider_id=None,
+        model_id=None,
+        state_before=None,
+        state_after=None,
+        reason_code=reason_code,
+        evidence_refs=(),
+        payload=payload,
+    )
+
+    try:
+        return append_orchestrator_event(draft)
+
+    except EventJournalError as exc:
+        print(
+            "EVENT JOURNAL WARNING: failed to record "
+            "external supervisor event: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def execute_external_supervisor_json_request(
     text: str,
 ) -> dict[str, Any]:
     try:
         request = external_supervisor_request_from_json(text)
+
     except OrchestratorError as exc:
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_REJECTED,
+            request=None,
+            reason_code="invalid_request",
+            details={
+                "error_type": type(exc).__name__,
+            },
+        )
+
         return {
             "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
             "request_id": None,
@@ -240,6 +2156,115 @@ def execute_external_supervisor_json_request(
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+
+    try:
+        reservation = reserve_external_supervisor_request(request)
+
+    except ExternalRequestLedgerError as exc:
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_INDETERMINATE,
+            request=request,
+            reason_code="reservation_state_unavailable",
+            details={
+                "error_type": type(exc).__name__,
+            },
+        )
+
+        return {
+            "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
+            "request_id": request.request_id,
+            "disposition": "internal_error",
+            "result": None,
+            "output": "",
+            "diagnostics": "",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+    if reservation.state is ExternalRequestReservationState.CONFLICT:
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_CONFLICT,
+            request=request,
+            reason_code="request_id_fingerprint_conflict",
+        )
+
+        return {
+            "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
+            "request_id": request.request_id,
+            "disposition": "rejected",
+            "result": None,
+            "output": "",
+            "diagnostics": "",
+            "error_type": ExternalRequestReplayConflictError.__name__,
+            "error": (
+                "External supervisor request_id was reused with "
+                "different request content"
+            ),
+        }
+
+    if (
+        reservation.state
+        is ExternalRequestReservationState.ACTIVE_OR_INDETERMINATE
+    ):
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_INDETERMINATE,
+            request=request,
+            reason_code="active_or_indeterminate_request",
+        )
+
+        return {
+            "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
+            "request_id": request.request_id,
+            "disposition": "failed",
+            "result": None,
+            "output": "",
+            "diagnostics": "",
+            "error_type": ExternalRequestReplayIndeterminateError.__name__,
+            "error": (
+                "External supervisor request already exists without "
+                "a terminal response; automatic replay refused"
+            ),
+        }
+
+    if reservation.state is ExternalRequestReservationState.REPLAY:
+        if reservation.response is None:
+            emit_external_supervisor_event(
+                OrchestratorEventType.REQUEST_INDETERMINATE,
+                request=request,
+                reason_code="terminal_replay_response_missing",
+            )
+
+            return {
+                "schema_version": (
+                    EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION
+                ),
+                "request_id": request.request_id,
+                "disposition": "internal_error",
+                "result": None,
+                "output": "",
+                "diagnostics": "",
+                "error_type": ExternalRequestLedgerError.__name__,
+                "error": "External request replay response is missing",
+            }
+
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_REPLAYED,
+            request=request,
+            reason_code="terminal_response_replayed",
+            details={
+                "terminal_disposition": (
+                    reservation.response.get("disposition")
+                ),
+            },
+        )
+
+        return dict(reservation.response)
+
+    emit_external_supervisor_event(
+        OrchestratorEventType.REQUEST_ACCEPTED,
+        request=request,
+        reason_code="durable_reservation",
+    )
 
     stdout_buffer = StringIO()
     stderr_buffer = StringIO()
@@ -252,7 +2277,7 @@ def execute_external_supervisor_json_request(
             result = dispatch_external_supervisor_request(request)
 
     except OrchestratorError as exc:
-        return {
+        response = {
             "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
             "request_id": request.request_id,
             "disposition": "failed",
@@ -264,7 +2289,7 @@ def execute_external_supervisor_json_request(
         }
 
     except Exception as exc:  # noqa: BLE001
-        return {
+        response = {
             "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
             "request_id": request.request_id,
             "disposition": "internal_error",
@@ -275,16 +2300,68 @@ def execute_external_supervisor_json_request(
             "error": None,
         }
 
-    return {
-        "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
-        "request_id": request.request_id,
-        "disposition": "completed",
-        "result": result,
-        "output": stdout_buffer.getvalue(),
-        "diagnostics": stderr_buffer.getvalue(),
-        "error_type": None,
-        "error": None,
-    }
+    else:
+        response = {
+            "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
+            "request_id": request.request_id,
+            "disposition": "completed",
+            "result": result,
+            "output": stdout_buffer.getvalue(),
+            "diagnostics": stderr_buffer.getvalue(),
+            "error_type": None,
+            "error": None,
+        }
+
+    try:
+        persist_external_supervisor_response(
+            request,
+            request_fingerprint=reservation.request_fingerprint,
+            response=response,
+        )
+
+    except ExternalRequestLedgerError as exc:
+        emit_external_supervisor_event(
+            OrchestratorEventType.REQUEST_INDETERMINATE,
+            request=request,
+            reason_code="terminal_replay_persistence_failed",
+            details={
+                "error_type": type(exc).__name__,
+                "terminal_disposition": response["disposition"],
+            },
+        )
+
+        return {
+            "schema_version": EXTERNAL_SUPERVISOR_RESPONSE_SCHEMA_VERSION,
+            "request_id": request.request_id,
+            "disposition": "internal_error",
+            "result": None,
+            "output": "",
+            "diagnostics": "",
+            "error_type": type(exc).__name__,
+            "error": (
+                "External request completed but its terminal replay "
+                "record could not be persisted; automatic retry with "
+                "this request_id is unsafe"
+            ),
+        }
+
+    terminal_event_type = (
+        OrchestratorEventType.REQUEST_COMPLETED
+        if response["disposition"] == "completed"
+        else OrchestratorEventType.REQUEST_FAILED
+    )
+
+    emit_external_supervisor_event(
+        terminal_event_type,
+        request=request,
+        reason_code="terminal_response_persisted",
+        details={
+            "terminal_disposition": response["disposition"],
+            "error_type": response["error_type"],
+        },
+    )
+
+    return response
 
 
 def validate_external_supervisor_request(
@@ -976,6 +3053,89 @@ class WorkerExecutionResult:
     telemetry: ExecutionTelemetry
 
 
+def emit_worker_execution_event(
+    event_type: OrchestratorEventType,
+    *,
+    request: WorkerExecutionRequest,
+    reason_code: str | None = None,
+    details: Mapping[str, Any] | None = None,
+) -> OrchestratorEvent | None:
+    if not isinstance(event_type, OrchestratorEventType):
+        raise OrchestratorError(
+            "Worker execution event type must use "
+            "OrchestratorEventType"
+        )
+
+    allowed_event_types = frozenset(
+        {
+            OrchestratorEventType.BUDGET_RESOLVED,
+            OrchestratorEventType.EXECUTION_STARTED,
+            OrchestratorEventType.EXECUTION_COMPLETED,
+            OrchestratorEventType.EXECUTION_TIMED_OUT,
+            OrchestratorEventType.EXECUTION_FAILED,
+        }
+    )
+
+    if event_type not in allowed_event_types:
+        raise OrchestratorError(
+            "Worker execution emitter does not support "
+            f"{event_type.value!r}"
+        )
+
+    if not isinstance(request, WorkerExecutionRequest):
+        raise OrchestratorError(
+            "Worker execution event requires "
+            "WorkerExecutionRequest"
+        )
+
+    if details is not None and not isinstance(details, Mapping):
+        raise OrchestratorError(
+            "Worker execution event details must be a mapping"
+        )
+
+    payload: dict[str, Any] = {
+        "attempt_id": request.attempt_id,
+    }
+
+    if details is not None:
+        payload["details"] = dict(details)
+
+    draft = OrchestratorEventDraft(
+        schema_version=TRUST_EVENT_SCHEMA_VERSION,
+        event_id=f"evt-{uuid.uuid4().hex}",
+        event_type=event_type.value,
+        occurred_at=utc_now(),
+        source_class=(
+            OrchestratorEventSource.EXECUTION_SUPERVISOR
+        ),
+        component="worker_execution_supervisor",
+        task_id=request.task_id,
+        execution_id=request.execution_id,
+        parent_execution_id=None,
+        request_id=None,
+        worker_role=None,
+        provider_id=request.provider_id,
+        model_id=request.model_id,
+        state_before=None,
+        state_after=None,
+        reason_code=reason_code,
+        evidence_refs=(),
+        payload=payload,
+    )
+
+    try:
+        return append_orchestrator_event(draft)
+
+    except EventJournalError as exc:
+        print(
+            "EVENT JOURNAL WARNING: failed to record "
+            "worker execution event: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def supervise_worker_execution(
     request: WorkerExecutionRequest,
     execute_transport: Callable[
@@ -990,6 +3150,31 @@ def supervise_worker_execution(
         prediction = predict_execution_timeout(
             request.budget,
             max_output_tokens=request.max_output_tokens,
+        )
+
+        emit_worker_execution_event(
+            OrchestratorEventType.BUDGET_RESOLVED,
+            request=request,
+            reason_code="execution_timeout_resolved",
+            details={
+                "timeout_seconds": prediction.timeout_seconds,
+                "prediction_source": prediction.source,
+                "estimated_prefill_seconds": (
+                    prediction.estimated_prefill_seconds
+                ),
+                "estimated_decode_seconds": (
+                    prediction.estimated_decode_seconds
+                ),
+            },
+        )
+
+        emit_worker_execution_event(
+            OrchestratorEventType.EXECUTION_STARTED,
+            request=request,
+            reason_code="worker_transport_invocation",
+            details={
+                "timeout_seconds": prediction.timeout_seconds,
+            },
         )
 
         try:
@@ -1017,7 +3202,7 @@ def supervise_worker_execution(
             3,
         )
 
-        return WorkerExecutionResult(
+        result = WorkerExecutionResult(
             execution_id=request.execution_id,
             state=ExecutionState.TIMED_OUT,
             output=None,
@@ -1029,13 +3214,25 @@ def supervise_worker_execution(
             ),
         )
 
+        emit_worker_execution_event(
+            OrchestratorEventType.EXECUTION_TIMED_OUT,
+            request=request,
+            reason_code="worker_timeout",
+            details={
+                "elapsed_seconds": elapsed,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+        return result
+
     except OrchestratorError as exc:
         elapsed = round(
             time.perf_counter() - started,
             3,
         )
 
-        return WorkerExecutionResult(
+        result = WorkerExecutionResult(
             execution_id=request.execution_id,
             state=ExecutionState.FAILED,
             output=None,
@@ -1047,12 +3244,24 @@ def supervise_worker_execution(
             ),
         )
 
+        emit_worker_execution_event(
+            OrchestratorEventType.EXECUTION_FAILED,
+            request=request,
+            reason_code="worker_execution_failed",
+            details={
+                "elapsed_seconds": elapsed,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+        return result
+
     elapsed = round(
         time.perf_counter() - started,
         3,
     )
 
-    return WorkerExecutionResult(
+    result = WorkerExecutionResult(
         execution_id=request.execution_id,
         state=ExecutionState.COMPLETED,
         output=output,
@@ -1063,6 +3272,17 @@ def supervise_worker_execution(
             elapsed_seconds=elapsed,
         ),
     )
+
+    emit_worker_execution_event(
+        OrchestratorEventType.EXECUTION_COMPLETED,
+        request=request,
+        reason_code="worker_transport_completed",
+        details={
+            "elapsed_seconds": elapsed,
+        },
+    )
+
+    return result
 
 
 @dataclass(frozen=True)
@@ -1239,6 +3459,146 @@ def resolve_provider_capabilities(
             )
 
     return capabilities
+
+
+def emit_provider_inventory_event(
+    *,
+    provider_id: str,
+    models: list[str],
+    task_id: str | None = None,
+) -> OrchestratorEvent | None:
+    if (
+        not isinstance(provider_id, str)
+        or not provider_id.strip()
+        or provider_id != provider_id.strip()
+    ):
+        raise OrchestratorError(
+            "Provider inventory event requires a canonical provider ID"
+        )
+
+    if task_id is not None and (
+        not isinstance(task_id, str)
+        or not task_id.strip()
+        or task_id != task_id.strip()
+    ):
+        raise OrchestratorError(
+            "Provider inventory event task_id must be null or canonical"
+        )
+
+    if not isinstance(models, list):
+        raise OrchestratorError(
+            "Provider inventory event models must be a list"
+        )
+
+    for model_id in models:
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise OrchestratorError(
+                "Provider inventory event model IDs must be "
+                "non-empty strings"
+            )
+
+    draft = OrchestratorEventDraft(
+        schema_version=TRUST_EVENT_SCHEMA_VERSION,
+        event_id=f"evt-{uuid.uuid4().hex}",
+        event_type=(
+            OrchestratorEventType.PROVIDER_INVENTORY_OBSERVED.value
+        ),
+        occurred_at=utc_now(),
+        source_class=OrchestratorEventSource.PROVIDER,
+        component="worker_provider_inventory",
+        task_id=task_id,
+        execution_id=None,
+        parent_execution_id=None,
+        request_id=None,
+        worker_role=None,
+        provider_id=provider_id,
+        model_id=None,
+        state_before=None,
+        state_after=None,
+        reason_code="validated_inventory_observed",
+        evidence_refs=(),
+        payload={
+            "model_count": len(models),
+            "models": list(models),
+        },
+    )
+
+    try:
+        return append_orchestrator_event(draft)
+
+    except EventJournalError as exc:
+        print(
+            "EVENT JOURNAL WARNING: failed to record "
+            "provider inventory event: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def emit_model_binding_event(
+    *,
+    worker_role: str,
+    provider_id: str,
+    model_id: str,
+    task_id: str | None = None,
+) -> OrchestratorEvent | None:
+    for field_name, value in (
+        ("worker_role", worker_role),
+        ("provider_id", provider_id),
+        ("model_id", model_id),
+    ):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+        ):
+            raise OrchestratorError(
+                "Model binding event requires canonical "
+                f"{field_name}"
+            )
+
+    if task_id is not None and (
+        not isinstance(task_id, str)
+        or not task_id.strip()
+        or task_id != task_id.strip()
+    ):
+        raise OrchestratorError(
+            "Model binding event task_id must be null or canonical"
+        )
+
+    draft = OrchestratorEventDraft(
+        schema_version=TRUST_EVENT_SCHEMA_VERSION,
+        event_id=f"evt-{uuid.uuid4().hex}",
+        event_type=OrchestratorEventType.MODEL_BINDING_SELECTED.value,
+        occurred_at=utc_now(),
+        source_class=OrchestratorEventSource.TRUSTED_CORE,
+        component="worker_model_binding",
+        task_id=task_id,
+        execution_id=None,
+        parent_execution_id=None,
+        request_id=None,
+        worker_role=worker_role,
+        provider_id=provider_id,
+        model_id=model_id,
+        state_before=None,
+        state_after=None,
+        reason_code="canonical_binding_selected",
+        evidence_refs=(),
+        payload={},
+    )
+
+    try:
+        return append_orchestrator_event(draft)
+
+    except EventJournalError as exc:
+        print(
+            "EVENT JOURNAL WARNING: failed to record "
+            "model binding event: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def resolve_provider_models(
@@ -2640,7 +5000,20 @@ def delegate(args: argparse.Namespace) -> int:
 
         raise
 
+    emit_provider_inventory_event(
+        provider_id=provider_id,
+        models=inventory,
+        task_id=task["task"]["task_id"],
+    )
+
     model = bind_worker(args.role, inventory)
+
+    emit_model_binding_event(
+        task_id=task["task"]["task_id"],
+        worker_role=args.role,
+        provider_id=provider_id,
+        model_id=model,
+    )
 
     context_parts = []
 
@@ -6422,6 +8795,315 @@ def verify(task_arg: str) -> int:
         )
 
         raise
+
+
+@dataclass(frozen=True)
+class TaskStatusProjection:
+    schema_version: str
+    task_id: str
+    active_project: str
+    task_class: str
+    risk_level: str
+    reasoning_mode: str
+    status: str
+    next_action: str | None
+    worker_calls_used: int
+    worker_calls_max: int
+    parallel_workers_active: int
+    local_runtime_seconds_used: float
+    cloud_worker_calls_used: int
+    checkpoint_last: str | None
+    checkpoint_resume_from: str | None
+    human_gate_status: str | None
+    human_gate_approval: str | None
+
+
+@dataclass(frozen=True)
+class TaskStatusProjectionCollection:
+    tasks: tuple[TaskStatusProjection, ...]
+    limit: int
+    truncated: bool
+
+
+TASK_STATUS_PROJECTION_LIST_MAX_LIMIT = 1000
+
+
+def _projection_required_string(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+    ):
+        raise OrchestratorError(
+            f"{field_name} must be a canonical non-empty string"
+        )
+
+    return value
+
+
+def _projection_optional_string(
+    value: object,
+    *,
+    field_name: str,
+) -> str | None:
+    if value is None:
+        return None
+
+    return _projection_required_string(
+        value,
+        field_name=field_name,
+    )
+
+
+def _projection_nonnegative_int(
+    value: object,
+    *,
+    field_name: str,
+) -> int:
+    if type(value) is not int or value < 0:
+        raise OrchestratorError(
+            f"{field_name} must be a non-negative integer"
+        )
+
+    return value
+
+
+def _projection_nonnegative_number(
+    value: object,
+    *,
+    field_name: str,
+) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value < 0
+        or not math.isfinite(float(value))
+    ):
+        raise OrchestratorError(
+            f"{field_name} must be a finite non-negative number"
+        )
+
+    return float(value)
+
+
+def read_task_status_projection(
+    task_reference: str,
+) -> TaskStatusProjection:
+    task_path = resolve_external_supervisor_task_path(
+        task_reference
+    )
+
+    _, project, task, _ = load_contract(str(task_path))
+
+    task_metadata = task.get("task")
+
+    if not isinstance(task_metadata, dict):
+        raise OrchestratorError(
+            "Task metadata must be a mapping"
+        )
+
+    budget = task.get("budget", {})
+
+    if not isinstance(budget, dict):
+        raise OrchestratorError(
+            "Task budget must be a mapping"
+        )
+
+    project_budget = project.get("budget", {})
+
+    if not isinstance(project_budget, dict):
+        raise OrchestratorError(
+            "Project budget must be a mapping"
+        )
+
+    checkpoint = task.get("checkpoint", {})
+
+    if not isinstance(checkpoint, dict):
+        raise OrchestratorError(
+            "Task checkpoint must be a mapping"
+        )
+
+    human_gate = task.get("human_gate")
+
+    if human_gate is None:
+        human_gate_status = None
+        human_gate_approval = None
+
+    elif isinstance(human_gate, dict):
+        human_gate_status = _projection_optional_string(
+            human_gate.get("status"),
+            field_name="human_gate.status",
+        )
+        human_gate_approval = _projection_optional_string(
+            human_gate.get("approval"),
+            field_name="human_gate.approval",
+        )
+
+    else:
+        raise OrchestratorError(
+            "Task human_gate must be null or a mapping"
+        )
+
+    return TaskStatusProjection(
+        schema_version=_projection_required_string(
+            task.get("schema_version"),
+            field_name="schema_version",
+        ),
+        task_id=_projection_required_string(
+            task_metadata.get("task_id"),
+            field_name="task.task_id",
+        ),
+        active_project=_projection_required_string(
+            task_metadata.get("active_project"),
+            field_name="task.active_project",
+        ),
+        task_class=_projection_required_string(
+            task_metadata.get("class"),
+            field_name="task.class",
+        ),
+        risk_level=_projection_required_string(
+            task_metadata.get("risk_level"),
+            field_name="task.risk_level",
+        ),
+        reasoning_mode=_projection_required_string(
+            task_metadata.get("reasoning_mode"),
+            field_name="task.reasoning_mode",
+        ),
+        status=_projection_required_string(
+            task_metadata.get("status"),
+            field_name="task.status",
+        ),
+        next_action=_projection_optional_string(
+            task.get("next_action"),
+            field_name="next_action",
+        ),
+        worker_calls_used=_projection_nonnegative_int(
+            budget.get("worker_calls_used", 0),
+            field_name="budget.worker_calls_used",
+        ),
+        worker_calls_max=_projection_nonnegative_int(
+            project_budget.get("max_worker_calls"),
+            field_name="project.budget.max_worker_calls",
+        ),
+        parallel_workers_active=_projection_nonnegative_int(
+            budget.get("parallel_workers_active", 0),
+            field_name="budget.parallel_workers_active",
+        ),
+        local_runtime_seconds_used=(
+            _projection_nonnegative_number(
+                budget.get("local_runtime_seconds_used", 0),
+                field_name="budget.local_runtime_seconds_used",
+            )
+        ),
+        cloud_worker_calls_used=_projection_nonnegative_int(
+            budget.get("cloud_worker_calls_used", 0),
+            field_name="budget.cloud_worker_calls_used",
+        ),
+        checkpoint_last=_projection_optional_string(
+            checkpoint.get("last_checkpoint"),
+            field_name="checkpoint.last_checkpoint",
+        ),
+        checkpoint_resume_from=_projection_optional_string(
+            checkpoint.get("resume_from"),
+            field_name="checkpoint.resume_from",
+        ),
+        human_gate_status=human_gate_status,
+        human_gate_approval=human_gate_approval,
+    )
+
+
+def _validate_task_status_projection_list_limit(
+    limit: int,
+) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > TASK_STATUS_PROJECTION_LIST_MAX_LIMIT
+    ):
+        raise OrchestratorError(
+            "Task projection list limit must be an integer "
+            "between 1 and "
+            f"{TASK_STATUS_PROJECTION_LIST_MAX_LIMIT}"
+        )
+
+    return limit
+
+
+def read_task_status_projections_read_only(
+    *,
+    limit: int = 100,
+) -> TaskStatusProjectionCollection:
+    validated_limit = (
+        _validate_task_status_projection_list_limit(
+            limit
+        )
+    )
+
+    state_root = STATE_DIR
+
+    if not state_root.exists():
+        return TaskStatusProjectionCollection(
+            tasks=(),
+            limit=validated_limit,
+            truncated=False,
+        )
+
+    if not state_root.is_dir():
+        raise OrchestratorError(
+            "Trusted task state is unavailable"
+        )
+
+    try:
+        candidates = sorted(
+            (
+                entry
+                for entry in state_root.iterdir()
+                if entry.suffix.lower()
+                in (".yaml", ".yml")
+            ),
+            key=lambda entry: entry.name,
+        )
+    except OSError as exc:
+        raise OrchestratorError(
+            "Trusted task state is unavailable"
+        ) from exc
+
+    truncated = len(candidates) > validated_limit
+    selected = candidates[:validated_limit]
+
+    projections: list[TaskStatusProjection] = []
+
+    for candidate in selected:
+        try:
+            if (
+                candidate.is_symlink()
+                or not candidate.is_file()
+            ):
+                raise OrchestratorError(
+                    "Trusted task state contains an "
+                    "invalid YAML candidate"
+                )
+        except OSError as exc:
+            raise OrchestratorError(
+                "Trusted task state is unavailable"
+            ) from exc
+
+        projections.append(
+            read_task_status_projection(
+                candidate.name
+            )
+        )
+
+    return TaskStatusProjectionCollection(
+        tasks=tuple(projections),
+        limit=validated_limit,
+        truncated=truncated,
+    )
 
 
 def status(task_arg: str) -> int:

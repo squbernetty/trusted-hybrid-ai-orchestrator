@@ -33,18 +33,43 @@ jobs:
         with:
           python-version: '3.11.9'
 
+      - name: Set up Node.js 24.21.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Pin qualified npm 11.19.0
+        shell: pwsh
+        run: |
+          npm install --global npm@11.19.0 --ignore-scripts --no-audit --no-fund
+          if ((node --version) -ne "v24.21.0") {
+              throw "Unexpected Node.js version: $(node --version)"
+          }
+          if ((npm --version) -ne "11.19.0") {
+              throw "Unexpected npm version: $(npm --version)"
+          }
+
       - name: Install qualified dependencies
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check -r requirements.txt
           python -m pip install --disable-pip-version-check ruff==0.16.8
 
+      - name: Install locked UI dependencies
+        shell: pwsh
+        working-directory: ui
+        run: |
+          npm ci --no-audit --no-fund
+
       - name: Ruff
         shell: pwsh
         run: |
           python -m ruff check `
             orchestrator.py `
+            control_plane_api.py `
             evals/runtime-regression.py `
+            evals/control-plane-regression.py `
             evals/live-integration.py
 
       - name: Python compile
@@ -52,13 +77,26 @@ jobs:
         run: |
           python -m py_compile `
             orchestrator.py `
+            control_plane_api.py `
             evals/runtime-regression.py `
+            evals/control-plane-regression.py `
             evals/live-integration.py
 
-      - name: Deterministic regression
+      - name: Trusted-core regression
         shell: pwsh
         run: |
           python evals/runtime-regression.py
+
+      - name: Control-plane regression
+        shell: pwsh
+        run: |
+          python evals/control-plane-regression.py
+
+      - name: UI Alpha qualification
+        shell: pwsh
+        working-directory: ui
+        run: |
+          npm run qualify
 
       - name: Whitespace integrity
         shell: pwsh
