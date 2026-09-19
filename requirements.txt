@@ -1,1 +1,4 @@
 PyYAML==6.0.3
+fastapi==0.141.1
+uvicorn==0.53.0
+httpx2==2.13.0

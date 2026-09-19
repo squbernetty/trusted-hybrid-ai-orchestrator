@@ -1,5 +1,5 @@
 .venv/
-state/
+/state/
 traces/
 .idea/
 __pycache__/
@@ -14,3 +14,8 @@ projects/*.yaml
 # Behavioral qualification results may contain project-specific evidence.
 evals/results/*.yaml
 !evals/results/.gitkeep
+
+# Local UI dependency and build artifacts.
+ui/node_modules/
+ui/dist/
+ui/.vite/

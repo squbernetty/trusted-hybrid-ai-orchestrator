@@ -71,6 +71,8 @@ The runtime should not present judgment-heavy conclusions as deterministically v
 
 This repository implements the **v0.1 runtime contract** and has been published as a **public alpha**, beginning with `v0.1.0-alpha.1`.
 
+The current codebase also includes a qualified **local read-only control plane** and **N16 UI Alpha**. These extend observability and operator decision support; they do **not** expand trusted mutation authority.
+
 The alpha is intentionally constrained:
 
 - worker delegation topology is star-shaped;
@@ -79,6 +81,10 @@ The alpha is intentionally constrained:
 - LM Studio is the reference local provider;
 - the external supervisor interface is a one-shot local process, not a network service;
 - the external interface exposes only `status`, `preflight`, `delegate`, and `verify`;
+- the FastAPI control plane exposes read-only health, task, event, event-tail, and SSE observation endpoints;
+- the browser UI exposes exactly three operator surfaces: **Overview**, **Task / Execution**, and **Event Timeline**;
+- browser-local selection, filters, freshness, transport state, cursors, and gap-repair state are presentation metadata, not trusted orchestrator state;
+- the UI cannot approve, mutate task state, delegate work, cancel execution, commit, push, merge, tag, release, or otherwise exercise trusted transition authority;
 - authority-bearing operations remain inside the trusted runtime and human approval boundary;
 - confirmed LM Studio backend cancellation is not currently claimed;
 - live progress streaming is not currently exposed by the LM Studio adapter.
@@ -97,12 +103,16 @@ A change in one namespace does not automatically imply a change in the others.
 
 ## Qualified environment
 
-The current public-alpha baseline has been exercised with:
+The current qualified baseline has been exercised with:
 
 - Windows
 - Python `3.11.9`
 - PyYAML `6.0.3`
+- Node.js `24.21.0`
+- npm `11.19.0`
 - LM Studio exposing its OpenAI-compatible local API
+
+The UI dependency contract is locked by `ui/package-lock.json`. CI installs the UI with `npm ci` and runs the complete UI Alpha qualification chain.
 
 Other environments may work but are not yet part of the qualified baseline.
 
@@ -111,6 +121,7 @@ Other environments may work but are not yet part of the qualified baseline.
 ```text
 trusted-hybrid-ai-orchestrator/
 ├── orchestrator.py
+├── control_plane_api.py
 ├── POLICY.md
 ├── global-policy.yaml
 ├── requirements.txt
@@ -120,8 +131,15 @@ trusted-hybrid-ai-orchestrator/
 ├── evals/
 │   ├── qualification-suite.yaml
 │   ├── runtime-regression.py
+│   ├── control-plane-regression.py
 │   ├── live-integration.py
 │   └── results/
+├── ui/
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── scripts/
+│   └── src/
+├── docs/
 ├── projects/
 ├── state/
 └── traces/
@@ -136,6 +154,42 @@ Project profiles may tighten the global policy but may not silently weaken it.
 Repository content, web content, tool output, worker output, and generated artifacts are untrusted data and cannot redefine policy or authority.
 
 `projects/*.yaml`, `state/`, `traces/`, and behavioral qualification result YAML files are local runtime/development data and are intentionally not tracked.
+
+## Read-only control plane and UI Alpha
+
+The N16 control plane and browser UI are observation surfaces over qualified trusted-state and event-journal readers.
+
+The control plane:
+
+- is implemented by `control_plane_api.py`;
+- exposes exactly six qualified `GET` routes;
+- disables `/docs`, `/redoc`, and `/openapi.json`;
+- exposes no POST, PUT, PATCH, or DELETE mutation route;
+- uses read-only observer seams for task and event data;
+- provides SSE as a transport for trusted event observations, not as transition authority.
+
+The browser UI:
+
+- is local and observability-first;
+- uses **Overview**, **Task / Execution**, and **Event Timeline** surfaces;
+- keeps task selection and event filtering browser-local;
+- preserves trusted `event_seq` ordering;
+- treats observation staleness, SSE transport state, observer integrity, and trusted execution state as separate concepts;
+- discloses bounded task/event observations instead of implying complete durable history;
+- remains non-authoritative even when displaying human-gate, verification, evidence, or transition events.
+
+N16 assumes local single-operator use. It does not provide remote multi-user isolation, a browser authorization model for mutation, or a writable control plane. Any future writable control plane requires a separate architecture and qualification phase.
+
+The current UI qualification entry point is:
+
+```powershell
+Push-Location .\ui
+npm ci --no-audit --no-fund
+npm run qualify
+Pop-Location
+```
+
+This builds and qualifies the UI and exercises its bounded same-origin `/api` proxy contract against a local loopback test backend. It is a qualification path, not a claim of a packaged production deployment workflow.
 
 ## 1. Create the Python environment
 
@@ -395,29 +449,55 @@ verify
 
 External callers cannot directly invoke adjudication, human approval, apply-change, completion, staging, or commit authority.
 
+Valid external `request_id` values are durably replay-controlled in `state/_external-request-ledger.sqlite3`. The runtime reserves a new request before dispatch. An identical duplicate with a stored terminal response replays that response without re-executing the operation. Reusing the same ID with different request content is rejected. A duplicate whose earlier request has no terminal response is treated as active or indeterminate and is never automatically re-executed. This provides duplicate suppression and conservative crash handling, not a general exactly-once guarantee across external side effects.
+
 ## 10. Regression and release qualification
 
-Run the deterministic regression suite:
+Run the deterministic trusted-core and control-plane regression suites:
 
 ```powershell
 & .\.venv\Scripts\python.exe .\evals\runtime-regression.py
+& .\.venv\Scripts\python.exe .\evals\control-plane-regression.py
 ```
 
-When Ruff is installed, run the static gates:
+When Ruff is installed, run the Python static gates:
 
 ```powershell
-& .\.venv\Scripts\python.exe -m ruff check .\orchestrator.py .\evals\runtime-regression.py .\evals\live-integration.py
-& .\.venv\Scripts\python.exe -m py_compile .\orchestrator.py .\evals\runtime-regression.py .\evals\live-integration.py
+& .\.venv\Scripts\python.exe -m ruff check `
+    .\orchestrator.py `
+    .\control_plane_api.py `
+    .\evals\runtime-regression.py `
+    .\evals\control-plane-regression.py `
+    .\evals\live-integration.py
+
+& .\.venv\Scripts\python.exe -m py_compile `
+    .\orchestrator.py `
+    .\control_plane_api.py `
+    .\evals\runtime-regression.py `
+    .\evals\control-plane-regression.py `
+    .\evals\live-integration.py
+
 git diff --check
 ```
 
-The environment-dependent live release qualification requires LM Studio and a compatible local worker model:
+Run the complete deterministic UI Alpha qualification:
+
+```powershell
+Push-Location .\ui
+npm ci --no-audit --no-fund
+npm run qualify
+Pop-Location
+```
+
+CI runs the deterministic Python and UI qualification gates. It intentionally does **not** execute the environment-dependent live LM Studio qualification.
+
+The separate live release qualification requires LM Studio and a compatible local worker model:
 
 ```powershell
 & .\.venv\Scripts\python.exe .\evals\live-integration.py
 ```
 
-The deterministic suite is intended for routine regression. The live integration suite is a release qualification gate.
+The deterministic suites are intended for routine regression and CI. The live integration suite remains a separate human-controlled provider/runtime release qualification gate.
 
 ## Security and authority model
 
@@ -440,8 +520,12 @@ The current alpha does not claim:
 - live streaming progress from the LM Studio adapter;
 - automatic project-profile generation;
 - automatic task-state initialization;
+- trusted mutation, approval, or execution control from the browser UI;
+- remote multi-user UI isolation or a browser authorization model;
+- durable-journal completeness in the bounded browser event window;
+- direct LM Studio management from the browser UI;
 - a network-hosted external supervisor service;
-- replay/idempotency enforcement for external supervisor `request_id` values; callers must not assume at-most-once execution;
+- automatic reconciliation of active or indeterminate external requests after process interruption; such requests require explicit recovery;
 - production-readiness or unattended consequential autonomy.
 
 These constraints are deliberate and should not be silently bypassed.
